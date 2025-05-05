@@ -3,6 +3,7 @@ import cors from 'cors';
 import mongoose from 'mongoose';
 import axios from 'axios';
 import dotenv from 'dotenv';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 dotenv.config();
 
@@ -11,103 +12,149 @@ app.use(cors({
   origin: 'https://scrap-frontend.vercel.app',
   credentials: true,
 }));
+
 app.use(express.json());
 
-// MongoDB Connection
 mongoose
   .connect(process.env.MONGO_URI)
   .then(() => console.log('MongoDB connected successfully'))
   .catch(err => console.error('MongoDB connection error:', err));
 
-// Review Schema
-const reviewSchema = new mongoose.Schema({
-  author: { type: String, required: true },
-  rating: { type: Number, required: true },
-  text: { type: String, required: true },
-  time: { type: String },
-  business: { type: String },
+
+const leadSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  address: { type: String, required: true },
+  phone: { type: String, required: true },
+  website: { type: String },
+  summary: { type: String },
 });
 
-const Review = mongoose.model('Review', reviewSchema);
+const Lead = mongoose.model('Lead', leadSchema);
 
-// Autocomplete Suggestions
-app.get('/api/suggestions', async (req, res) => {
-  const { query } = req.query;
 
-  if (!query) {
-    return res.status(400).json({ error: 'Query is required' });
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+
+
+const cleanSummary = (text) => {
+  if (!text) return 'No summary available.';
+  return text
+    .replace(/^"|"$/g, '') 
+    .replace(/```json|```|\[|\]/g, '') 
+    .replace(/\\"/g, '"') 
+    .replace(/^\d+\.\s*/, '') 
+    .trim();
+};
+
+app.post('/api/leads', async (req, res) => {
+  const { query, location } = req.body;
+
+  if (!query || !location) {
+    return res.status(400).json({ error: 'Query and location are required' });
   }
 
   try {
-    const response = await axios.get('https://serpapi.com/search', {
+    if (!process.env.SERP_API_KEY || !process.env.GEMINI_API_KEY) {
+      return res.status(500).json({ error: 'Server configuration error: Missing API keys' });
+    }
+
+  
+    const locationResponse = await axios.get('https://serpapi.com/search', {
       params: {
         engine: 'google_maps',
-        q: query,
+        q: location,
         type: 'search',
         api_key: process.env.SERP_API_KEY,
       },
     });
 
-    const suggestions = (response.data.local_results || []).map(place => ({
-      title: place.title,
-      address: place.address,
-      place_id: place.place_id,
-    }));
+    const coordinates = locationResponse.data.place_results?.gps_coordinates || 
+                       locationResponse.data.local_results?.[0]?.gps_coordinates || 
+                       { latitude: 40.7128, longitude: -74.0060 };
+    const ll = `@${coordinates.latitude},${coordinates.longitude},14z`;
 
-    res.json(suggestions);
-  } catch (error) {
-    console.error('Error fetching suggestions:', error.message);
-    res.status(500).json({ error: 'Error fetching suggestions' });
-  }
-});
+    
+    const serpResponse = await axios.get('https://serpapi.com/search', {
+      params: {
+        engine: 'google_maps',
+        q: query,
+        ll: ll,
+        type: 'search',
+        api_key: process.env.SERP_API_KEY,
+      },
+    });
 
-// Scrape Reviews
-app.post('/api/reviews', async (req, res) => {
-  const { placeId } = req.body;
-
-  if (!placeId) {
-    return res.status(400).json({ error: 'Place ID or URL is required' });
-  }
-
-  try {
-    const params = {
-      engine: 'google_maps_reviews',
-      api_key: process.env.SERP_API_KEY,
-      hl: 'en',
-    };
-
-    if (placeId.startsWith('https://')) {
-      params.url = placeId;
-    } else {
-      params.place_id = placeId;
+    const businesses = serpResponse.data.local_results || [];
+    if (!businesses.length) {
+      return res.status(404).json({ error: 'No businesses found' });
     }
 
-    const response = await axios.get('https://serpapi.com/search', { params });
-    const reviews = (response.data.reviews || []).slice(0, 10).map(review => ({
-      author: review.user.name || 'Anonymous',
-      rating: review.rating || 0,
-      text: review.snippet || 'No review text available.',
-      time: review.date || 'Date not available',
-      business: response.data.place_info?.title || 'Unknown Business',
+    const leads = businesses.map((business) => ({
+      name: business.title || 'Unknown',
+      address: business.address || 'Address not available',
+      phone: business.phone || 'Phone not available',
+      website: business.website,
+      description: business.description || 'No description available',
     }));
 
-    if (reviews.length < 5) {
-      return res.status(404).json({ error: 'Not enough reviews found' });
-    }
-
-    // Save reviews to MongoDB
+   
+    let summarizedLeads = leads;
     try {
-      await Review.insertMany(reviews, { ordered: false });
+      const descriptions = leads
+        .map((lead, index) => `${index + 1}. ${lead.name}: ${lead.description}`)
+        .join('\n');
+      const prompt = `Summarize each description in 50 words or less. Return a JSON array of strings, ensuring one summary per description provided. If a description is missing or unprocessable, return "No summary available." for that entry:\n${descriptions}`;
+
+      const result = await model.generateContent(prompt);
+      let summaries;
+      try {
+        summaries = JSON.parse(result.response.text());
+      } catch (parseError) {
+        console.error('Failed to parse Gemini response as JSON:', parseError.message);
+        
+        summaries = result.response.text()
+          .split('\n')
+          .filter(s => s.trim())
+          .map(s => cleanSummary(s)) || [];
+      }
+
+     
+      summaries = Array.isArray(summaries) ? summaries.map(cleanSummary) : [];
+      while (summaries.length < leads.length) {
+        summaries.push('No summary available.');
+      }
+
+      summarizedLeads = leads.map((lead, index) => ({
+        name: lead.name,
+        address: lead.address,
+        phone: lead.phone,
+        website: lead.website,
+        summary: summaries[index] || 'No summary available.',
+      }));
+    } catch (geminiError) {
+      console.error('Gemini API error:', geminiError.message);
+      summarizedLeads = leads.map(lead => ({
+        name: lead.name,
+        address: lead.address,
+        phone: lead.phone,
+        website: lead.website,
+        summary: 'Summary unavailable due to API error',
+      }));
+    }
+
+   
+    try {
+      await Lead.insertMany(summarizedLeads, { ordered: false });
     } catch (mongoError) {
       if (mongoError.code !== 11000) {
         throw mongoError;
       }
     }
 
-    res.json(reviews);
+    res.json(summarizedLeads);
   } catch (error) {
-    console.error('Error fetching reviews:', error.message, error.stack);
-    res.status(500).json({ error: 'Error fetching reviews', details: error.message });
+    console.error('Error in /api/leads:', error.message, error.stack);
+    res.status(500).json({ error: 'Error fetching or processing leads', details: error.message });
   }
 });
 
